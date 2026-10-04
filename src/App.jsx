@@ -42,6 +42,9 @@ function App() {
     risk_text: "BELIRSIZ"
   });
   const [frameCount, setFrameCount] = useState(0);
+  // 'pending' | 'active' | 'denied' | 'error'
+  const [cameraStatus, setCameraStatus] = useState('pending');
+  const [retryKey, setRetryKey] = useState(0);
 
   // Titremeyi azaltan üstel yumuşatma (kararlı analiz için)
   const smoothKeypoints = (kps) => {
@@ -115,24 +118,41 @@ function App() {
 
   useEffect(() => {
     let stopped = false;
+    let stream = null;
+    let failCount = 0;
 
-    navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "user",
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-        frameRate: { ideal: 30, max: 30 }
-      }
-    })
-      .then((stream) => {
-        if (videoRef.current) videoRef.current.srcObject = stream;
-      })
-      .catch((err) => console.error("Kamera hatası:", err));
+    const resetAnalysis = () => {
+      prevKpRef.current = {};
+      setAnalysisData({
+        view: "BEKLENIYOR",
+        keypoints: {},
+        spine_order: [],
+        metrics: {},
+        asymmetry_percentage: 0,
+        risk_text: "BELIRSIZ"
+      });
+      const c = displayCanvasRef.current;
+      if (c) c.getContext('2d').clearRect(0, 0, c.width, c.height);
+    };
+
+    // Kamera gerçekten canlı mı? (izin yok / reddedildi / sonradan kapatıldı ise false)
+    const cameraIsLive = () => {
+      const video = videoRef.current;
+      const track = stream && stream.getVideoTracks()[0];
+      return !!(
+        video && track &&
+        track.readyState === 'live' &&
+        track.enabled &&
+        !track.muted &&
+        video.readyState >= 2 &&
+        video.videoWidth > 0
+      );
+    };
 
     const sendFrame = async () => {
       const video = videoRef.current;
       const pCanvas = processingCanvasRef.current;
-      if (!video || !pCanvas || !video.videoWidth) return;
+      if (!video || !pCanvas) return;
 
       // Kareyi küçült: yükleme boyutu ve inference süresi düşer
       const scale = SEND_WIDTH / video.videoWidth;
@@ -141,7 +161,7 @@ function App() {
       pCanvas.getContext('2d').drawImage(video, 0, 0, pCanvas.width, pCanvas.height);
 
       const blob = await new Promise(res => pCanvas.toBlob(res, 'image/jpeg', JPEG_QUALITY));
-      if (!blob) return;
+      if (!blob || stopped) return;
 
       const formData = new FormData();
       formData.append("file", blob, "frame.jpg");
@@ -156,7 +176,8 @@ function App() {
           signal: controller.signal,
         });
         const result = await response.json();
-        if (result.error) return;
+        if (result.error || stopped) return;
+        failCount = 0;
 
         // Koordinatları orijinal video boyutuna geri ölçekle
         const inv = 1 / scale;
@@ -171,25 +192,73 @@ function App() {
         setFrameCount(prev => prev + 1);
         drawSkeleton(result.keypoints, result.spine_order);
       } catch (e) {
+        failCount++;
         if (e.name !== 'AbortError') console.error("API Bağlantı Hatası:", e);
       } finally {
         clearTimeout(timeout);
       }
     };
 
-    // Önceki istek bitmeden yenisi gönderilmez, kuyruk oluşmaz
+    // Önceki istek bitmeden yenisi gönderilmez; kamera yoksa / sekme gizliyse hiç istek atılmaz
     const loop = async () => {
       while (!stopped) {
+        if (!cameraIsLive() || document.hidden) {
+          await new Promise(r => setTimeout(r, 300));
+          continue;
+        }
         const t0 = performance.now();
         await sendFrame();
-        const wait = MIN_FRAME_GAP - (performance.now() - t0);
+        // Backend'e ulaşılamıyorsa bekleme süresini kademeli artır (en fazla 3 sn)
+        const gap = failCount > 0 ? Math.min(MIN_FRAME_GAP * 2 ** failCount, 3000) : MIN_FRAME_GAP;
+        const wait = gap - (performance.now() - t0);
         await new Promise(r => setTimeout(r, Math.max(wait, 10)));
       }
     };
-    loop();
 
-    return () => { stopped = true; };
-  }, [drawSkeleton]);
+    const onVisibility = () => { if (document.hidden) prevKpRef.current = {}; };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    setCameraStatus('pending');
+    resetAnalysis();
+
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user",
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        frameRate: { ideal: 30, max: 30 }
+      }
+    })
+      .then((s) => {
+        if (stopped) {
+          s.getTracks().forEach(t => t.stop());
+          return;
+        }
+        stream = s;
+        if (videoRef.current) videoRef.current.srcObject = s;
+        setCameraStatus('active');
+
+        // İzin sonradan geri alınırsa / kamera kapanırsa ölçümü durdur
+        s.getVideoTracks()[0].addEventListener('ended', () => {
+          setCameraStatus('denied');
+          resetAnalysis();
+        });
+
+        loop();
+      })
+      .catch((err) => {
+        console.error("Kamera hatası:", err);
+        const denied = err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.name === 'SecurityError');
+        setCameraStatus(denied ? 'denied' : 'error');
+        resetAnalysis();
+      });
+
+    return () => {
+      stopped = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    };
+  }, [drawSkeleton, retryKey]);
 
   const getViewColor = (view) => {
     if (view === "FRONT") return "#00ff00";
@@ -242,6 +311,46 @@ function App() {
         />
         {/* Arka planda FastAPI'ye göndermek için gizli canvas */}
         <canvas ref={processingCanvasRef} style={{ display: 'none' }} />
+
+        {/* Kamera izni yoksa / kamera açılamadıysa uyarı (bu durumda backend'e istek atılmaz) */}
+        {cameraStatus !== 'active' && (
+          <div style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: '12px',
+            padding: '20px',
+            textAlign: 'center',
+            background: 'rgba(0,0,0,0.85)',
+            zIndex: 20,
+            fontSize: '14px'
+          }}>
+            <div>
+              {cameraStatus === 'pending' && 'Kamera izni bekleniyor...'}
+              {cameraStatus === 'denied' && 'Kamera izni kapalı. Ölçüm durduruldu. Tarayıcı ayarlarından kamera iznini açıp tekrar dene.'}
+              {cameraStatus === 'error' && 'Kamera açılamadı. Başka bir uygulama kamerayı kullanıyor olabilir.'}
+            </div>
+            {cameraStatus !== 'pending' && (
+              <button
+                onClick={() => setRetryKey(k => k + 1)}
+                style={{
+                  padding: '8px 18px',
+                  borderRadius: '8px',
+                  border: '1px solid #00ffcc',
+                  background: 'transparent',
+                  color: '#00ffcc',
+                  fontSize: '14px',
+                  cursor: 'pointer'
+                }}
+              >
+                Tekrar dene
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Kamera Üzeri Yüzen Özet Kartı */}
         <div style={{
