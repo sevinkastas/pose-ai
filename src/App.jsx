@@ -23,6 +23,10 @@ const SKELETON_CONNECTIONS = [
 
 const KEY_SPINE = ["Spine_Top_C7", "Spine_Mid_Thoracic", "Spine_Low_Lumbar"];
 
+const SEND_WIDTH = 384;      // backend'e giden kare genişliği (320-480 arası dene)
+const JPEG_QUALITY = 0.6;
+const MIN_FRAME_GAP = 80;    // ms, istekler arası minimum bekleme
+
 function App() {
   const videoRef = useRef(null);
   const processingCanvasRef = useRef(null); // Backend'e görüntü göndermek için gizli canvas
@@ -110,54 +114,81 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // Kamerayı başlat
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } })
+    let stopped = false;
+
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "user",
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        frameRate: { ideal: 30, max: 30 }
+      }
+    })
       .then((stream) => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
+        if (videoRef.current) videoRef.current.srcObject = stream;
       })
       .catch((err) => console.error("Kamera hatası:", err));
 
-    // Belirli aralıklarla kareyi backend'e gönder
-    const interval = setInterval(async () => {
-      if (!videoRef.current || !processingCanvasRef.current) return;
+    const sendFrame = async () => {
       const video = videoRef.current;
       const pCanvas = processingCanvasRef.current;
-      const ctx = pCanvas.getContext('2d');
+      if (!video || !pCanvas || !video.videoWidth) return;
 
-      pCanvas.width = video.videoWidth || 640;
-      pCanvas.height = video.videoHeight || 480;
-      ctx.drawImage(video, 0, 0, pCanvas.width, pCanvas.height);
+      // Kareyi küçült: yükleme boyutu ve inference süresi düşer
+      const scale = SEND_WIDTH / video.videoWidth;
+      pCanvas.width = SEND_WIDTH;
+      pCanvas.height = Math.round(video.videoHeight * scale);
+      pCanvas.getContext('2d').drawImage(video, 0, 0, pCanvas.width, pCanvas.height);
 
-      pCanvas.toBlob(async (blob) => {
-        if (!blob) return;
-        const formData = new FormData();
-        formData.append("file", blob, "frame.jpg");
+      const blob = await new Promise(res => pCanvas.toBlob(res, 'image/jpeg', JPEG_QUALITY));
+      if (!blob) return;
 
-        try {
-          const response = await fetch("https://prevail-exponent-repair.ngrok-free.dev/process-frame", {
-            method: "POST",
-            body: formData,
-          });
-          const result = await response.json();
-          if (result.error) return;
+      const formData = new FormData();
+      formData.append("file", blob, "frame.jpg");
 
-          result.keypoints = smoothKeypoints(result.keypoints);
-          result.spine_order = result.spine_order || [];
-          setAnalysisData(result);
-          setFrameCount(prev => prev + 1);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
 
-          // Gelen koordinatları ekrandaki canvas'a çizdir
-          drawSkeleton(result.keypoints, result.spine_order);
-        } catch (e) {
-          console.error("API Bağlantı Hatası:", e);
-        }
-      }, 'image/jpeg', 0.5);
+      try {
+        const response = await fetch("https://prevail-exponent-repair.ngrok-free.dev/process-frame", {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+        const result = await response.json();
+        if (result.error) return;
 
-    }, 250);
+        // Koordinatları orijinal video boyutuna geri ölçekle
+        const inv = 1 / scale;
+        const scaled = {};
+        Object.entries(result.keypoints || {}).forEach(([name, pt]) => {
+          scaled[name] = { ...pt, x: pt.x * inv, y: pt.y * inv };
+        });
 
-    return () => clearInterval(interval);
+        result.keypoints = smoothKeypoints(scaled);
+        result.spine_order = result.spine_order || [];
+        setAnalysisData(result);
+        setFrameCount(prev => prev + 1);
+        drawSkeleton(result.keypoints, result.spine_order);
+      } catch (e) {
+        if (e.name !== 'AbortError') console.error("API Bağlantı Hatası:", e);
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    // Önceki istek bitmeden yenisi gönderilmez, kuyruk oluşmaz
+    const loop = async () => {
+      while (!stopped) {
+        const t0 = performance.now();
+        await sendFrame();
+        const wait = MIN_FRAME_GAP - (performance.now() - t0);
+        await new Promise(r => setTimeout(r, Math.max(wait, 10)));
+      }
+    };
+    loop();
+
+    return () => { stopped = true; };
   }, [drawSkeleton]);
 
   const getViewColor = (view) => {
