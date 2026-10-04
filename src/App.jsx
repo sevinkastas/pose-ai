@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import './App.css';
 
-// İskelet bağlantı çizgileri (Hangi noktanın hangisiyle birleşeceği)
+// İskelet bağlantı çizgileri (omurga burada yok, backend'in verdiği sırayla dinamik çizilir)
 const SKELETON_CONNECTIONS = [
   ["Left Shoulder", "Right Shoulder"],
   ["Left Shoulder", "Left Hip"],
@@ -18,31 +18,43 @@ const SKELETON_CONNECTIONS = [
   ["Nose", "Left Eye"],
   ["Nose", "Right Eye"],
   ["Left Eye", "Left Ear"],
-  ["Right Eye", "Right Ear"],
-  ["Spine_Top_C7", "Spine_Point_2"],
-  ["Spine_Point_2", "Spine_Mid_Thoracic"],
-  ["Spine_Mid_Thoracic", "Spine_Point_4"],
-  ["Spine_Point_4", "Spine_Low_Lumbar"],
-  ["Spine_Low_Lumbar", "Spine_Point_7"]
+  ["Right Eye", "Right Ear"]
 ];
+
+const KEY_SPINE = ["Spine_Top_C7", "Spine_Mid_Thoracic", "Spine_Low_Lumbar"];
 
 function App() {
   const videoRef = useRef(null);
   const processingCanvasRef = useRef(null); // Backend'e görüntü göndermek için gizli canvas
   const displayCanvasRef = useRef(null);    // Ekranda iskelet çizmek için görünür canvas
+  const prevKpRef = useRef({});             // Yumuşatma için önceki kare noktaları
 
   const [analysisData, setAnalysisData] = useState({
     view: "BEKLENIYOR",
     keypoints: {},
+    spine_order: [],
     metrics: {},
     asymmetry_percentage: 0,
     risk_text: "BELIRSIZ"
   });
   const [frameCount, setFrameCount] = useState(0);
 
+  // Titremeyi azaltan üstel yumuşatma (kararlı analiz için)
+  const smoothKeypoints = (kps) => {
+    const prev = prevKpRef.current;
+    const out = {};
+    Object.entries(kps || {}).forEach(([name, pt]) => {
+      const p = prev[name];
+      out[name] = p
+        ? { ...pt, x: p.x * 0.6 + pt.x * 0.4, y: p.y * 0.6 + pt.y * 0.4 }
+        : pt;
+    });
+    prevKpRef.current = out;
+    return out;
+  };
+
   // Canvas üzerine iskelet ve noktaları çizen fonksiyon
-  // Canvas üzerine iskelet ve noktaları çizen fonksiyon
-  const drawSkeleton = useCallback((keypoints) => {
+  const drawSkeleton = useCallback((keypoints, spineOrder = []) => {
     const canvas = displayCanvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -57,41 +69,42 @@ function App() {
 
     if (!keypoints || Object.keys(keypoints).length === 0) return;
 
-    // 1. Önce normal iskelet bağlantı çizgilerini çiz (Turkuaz)
+    // 1. Normal iskelet bağlantı çizgileri (Turkuaz)
     ctx.strokeStyle = '#00ffcc';
     ctx.lineWidth = 2;
     SKELETON_CONNECTIONS.forEach(([p1, p2]) => {
-      // Eğer omurga bağlantısı değilse normal çiz
-      if (!p1.includes("Spine") && !p2.includes("Spine")) {
-        if (keypoints[p1] && keypoints[p2]) {
-          ctx.beginPath();
-          ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
-          ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
-          ctx.stroke();
-        }
+      if (keypoints[p1] && keypoints[p2]) {
+        ctx.beginPath();
+        ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
+        ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
+        ctx.stroke();
       }
     });
 
-    // 2. SIRT / OMURGA bağlantı çizgilerini özel renk ile çiz (Örn: Canlı Turuncu/Sarı)
-    ctx.strokeStyle = '#ff9900';
-    ctx.lineWidth = 3; // Sırt çizgisi biraz daha kalın olsun
-    SKELETON_CONNECTIONS.forEach(([p1, p2]) => {
-      // Sadece omurga (Spine) içeren bağlantıları burada çiz
-      if (p1.includes("Spine") || p2.includes("Spine")) {
-        if (keypoints[p1] && keypoints[p2]) {
-          ctx.beginPath();
-          ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
-          ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
-          ctx.stroke();
-        }
-      }
-    });
-
-    // 3. Sonra tespit edilen tüm noktaları daire olarak çiz (Omurga noktaları farklı renk)
-    Object.entries(keypoints).forEach(([name, pt]) => {
-      ctx.fillStyle = name.includes("Spine") ? '#ff3300' : '#ff00ff'; // Sırt noktaları kırmızı/turuncu, diğerleri pembe
+    // 2. Omurga: backend'in verdiği sırayla tek bir yumuşak eğri
+    const spinePts = spineOrder.map(n => keypoints[n]).filter(Boolean);
+    if (spinePts.length > 1) {
+      ctx.strokeStyle = '#ff9900';
+      ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.arc(pt.x, pt.y, name.includes("Spine") ? 4 : 3, 0, 2 * Math.PI); // Sırt noktaları biraz daha büyük
+      ctx.moveTo(spinePts[0].x, spinePts[0].y);
+      for (let i = 1; i < spinePts.length - 1; i++) {
+        const mx = (spinePts[i].x + spinePts[i + 1].x) / 2;
+        const my = (spinePts[i].y + spinePts[i + 1].y) / 2;
+        ctx.quadraticCurveTo(spinePts[i].x, spinePts[i].y, mx, my);
+      }
+      const last = spinePts[spinePts.length - 1];
+      ctx.lineTo(last.x, last.y);
+      ctx.stroke();
+    }
+
+    // 3. Noktalar (3 kritik omurga noktası daha büyük ve farklı renk)
+    Object.entries(keypoints).forEach(([name, pt]) => {
+      const isSpine = name.startsWith("Spine");
+      const isKey = KEY_SPINE.includes(name);
+      ctx.fillStyle = isKey ? '#ff3300' : isSpine ? '#ffcc00' : '#ff00ff';
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, isKey ? 7 : isSpine ? 4 : 3, 0, 2 * Math.PI);
       ctx.fill();
     });
   }, []);
@@ -128,11 +141,15 @@ function App() {
             body: formData,
           });
           const result = await response.json();
+          if (result.error) return;
+
+          result.keypoints = smoothKeypoints(result.keypoints);
+          result.spine_order = result.spine_order || [];
           setAnalysisData(result);
           setFrameCount(prev => prev + 1);
 
           // Gelen koordinatları ekrandaki canvas'a çizdir
-          drawSkeleton(result.keypoints);
+          drawSkeleton(result.keypoints, result.spine_order);
         } catch (e) {
           console.error("API Bağlantı Hatası:", e);
         }
