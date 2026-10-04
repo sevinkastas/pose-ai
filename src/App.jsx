@@ -41,6 +41,7 @@ function App() {
   const [frameCount, setFrameCount] = useState(0);
 
   // Canvas üzerine iskelet ve noktaları çizen fonksiyon
+  // Canvas üzerine iskelet ve noktaları çizen fonksiyon
   const drawSkeleton = useCallback((keypoints) => {
     const canvas = displayCanvasRef.current;
     const video = videoRef.current;
@@ -56,23 +57,41 @@ function App() {
 
     if (!keypoints || Object.keys(keypoints).length === 0) return;
 
-    // 1. Önce iskelet bağlantı çizgilerini çiz
+    // 1. Önce normal iskelet bağlantı çizgilerini çiz (Turkuaz)
     ctx.strokeStyle = '#00ffcc';
     ctx.lineWidth = 2;
     SKELETON_CONNECTIONS.forEach(([p1, p2]) => {
-      if (keypoints[p1] && keypoints[p2]) {
-        ctx.beginPath();
-        ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
-        ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
-        ctx.stroke();
+      // Eğer omurga bağlantısı değilse normal çiz
+      if (!p1.includes("Spine") && !p2.includes("Spine")) {
+        if (keypoints[p1] && keypoints[p2]) {
+          ctx.beginPath();
+          ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
+          ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
+          ctx.stroke();
+        }
       }
     });
 
-    // 2. Sonra tespit edilen tüm noktaları daire olarak çiz
+    // 2. SIRT / OMURGA bağlantı çizgilerini özel renk ile çiz (Örn: Canlı Turuncu/Sarı)
+    ctx.strokeStyle = '#ff9900';
+    ctx.lineWidth = 3; // Sırt çizgisi biraz daha kalın olsun
+    SKELETON_CONNECTIONS.forEach(([p1, p2]) => {
+      // Sadece omurga (Spine) içeren bağlantıları burada çiz
+      if (p1.includes("Spine") || p2.includes("Spine")) {
+        if (keypoints[p1] && keypoints[p2]) {
+          ctx.beginPath();
+          ctx.moveTo(keypoints[p1].x, keypoints[p1].y);
+          ctx.lineTo(keypoints[p2].x, keypoints[p2].y);
+          ctx.stroke();
+        }
+      }
+    });
+
+    // 3. Sonra tespit edilen tüm noktaları daire olarak çiz (Omurga noktaları farklı renk)
     Object.entries(keypoints).forEach(([name, pt]) => {
-      ctx.fillStyle = '#ff00ff';
+      ctx.fillStyle = name.includes("Spine") ? '#ff3300' : '#ff00ff'; // Sırt noktaları kırmızı/turuncu, diğerleri pembe
       ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 3, 0, 2 * Math.PI);
+      ctx.arc(pt.x, pt.y, name.includes("Spine") ? 4 : 3, 0, 2 * Math.PI); // Sırt noktaları biraz daha büyük
       ctx.fill();
     });
   }, []);
