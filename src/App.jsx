@@ -18,7 +18,12 @@ const SKELETON_CONNECTIONS = [
   ["Nose", "Left Eye"],
   ["Nose", "Right Eye"],
   ["Left Eye", "Left Ear"],
-  ["Right Eye", "Right Ear"]
+  ["Right Eye", "Right Ear"],
+  ["Spine_Top_C7", "Spine_Point_2"],
+  ["Spine_Point_2", "Spine_Mid_Thoracic"],
+  ["Spine_Mid_Thoracic", "Spine_Point_4"],
+  ["Spine_Point_4", "Spine_Low_Lumbar"],
+  ["Spine_Low_Lumbar", "Spine_Point_7"]
 ];
 
 function App() {
@@ -226,20 +231,26 @@ function App() {
               Kişi algılanıyor veya kamera FRAME bekleniyor...
             </div>
           ) : (
-            Object.entries(analysisData.keypoints).map(([name, pt]) => (
-              <div key={name} style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                padding: '6px 10px',
-                borderBottom: '1px solid #1a1a1a',
-                fontSize: '12px'
-              }}>
-                <span style={{ color: '#ccc' }}>{name}</span>
-                <span style={{ color: '#00ff00', fontWeight: 'bold' }}>
-                  X: {Math.round(pt.x)} | Y: {Math.round(pt.y)}
-                </span>
-              </div>
-            ))
+            Object.entries(analysisData.keypoints).map(([name, pt]) => {
+              const isSpine = name.includes("Spine");
+              return (
+                <div key={name} style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  padding: '6px 10px',
+                  borderBottom: '1px solid #1a1a1a',
+                  fontSize: '12px',
+                  background: isSpine ? 'rgba(0, 255, 204, 0.08)' : 'transparent'
+                }}>
+                  <span style={{ color: isSpine ? '#00ffcc' : '#ccc', fontWeight: isSpine ? 'bold' : 'normal' }}>
+                    {isSpine ? `📍 ${name}` : name}
+                  </span>
+                  <span style={{ color: '#00ff00', fontWeight: 'bold' }}>
+                    X: {Math.round(pt.x)} | Y: {Math.round(pt.y)}
+                  </span>
+                </div>
+              );
+            })
           )}
         </div>
       </div>
