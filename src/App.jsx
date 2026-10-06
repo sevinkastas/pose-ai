@@ -23,15 +23,25 @@ const SKELETON_CONNECTIONS = [
 
 const KEY_SPINE = ["Spine_Top_C7", "Spine_Mid_Thoracic", "Spine_Low_Lumbar"];
 
-const SEND_WIDTH = 384;      // backend'e giden kare genişliği (320-480 arası dene)
-const JPEG_QUALITY = 0.6;
-const MIN_FRAME_GAP = 80;    // ms, istekler arası minimum bekleme
+const SEND_WIDTH = 320;      // backend'e giden kare genişliği (320 ideal hız/doğruluk dengesi)
+const JPEG_QUALITY = 0.5;
+const POLL_MS = 130;         // backend yoklama aralığı (~7-8 FPS, istekler üst üste binmez)
+const UI_UPDATE_MS = 300;    // React panel güncelleme aralığı (her inference'ta setState yok)
 
 function App() {
   const videoRef = useRef(null);
   const processingCanvasRef = useRef(null); // Backend'e görüntü göndermek için gizli canvas
   const displayCanvasRef = useRef(null);    // Ekranda iskelet çizmek için görünür canvas
   const prevKpRef = useRef({});             // Yumuşatma için önceki kare noktaları
+  // Hızlandırma: render ile inference ayrı döngülerde çalışır.
+  // latestRef = ekrana her frame çizilen son sonuç, uiRef = React paneline seyreltilmiş yazılan veri.
+  const latestRef = useRef({ keypoints: {}, spine_order: [] });
+  const uiRef = useRef({
+    view: "BEKLENIYOR", keypoints: {}, spine_order: [],
+    metrics: {}, asymmetry_percentage: 0, risk_text: "BELIRSIZ",
+  });
+  const inFlightRef = useRef(false);        // Üst üste istek engeli (tek-uçuş)
+  const frameIdRef = useRef(0);
 
   const [analysisData, setAnalysisData] = useState({
     view: "BEKLENIYOR",
@@ -46,8 +56,8 @@ function App() {
   const [cameraStatus, setCameraStatus] = useState('pending');
   const [retryKey, setRetryKey] = useState(0);
 
-  // Titremeyi azaltan üstel yumuşatma (kararlı analiz için)
-  const smoothKeypoints = (kps) => {
+  // Titremeyi azaltan üstel yumuşatma (kararlı analiz için, stabil referans)
+  const smoothKeypoints = useCallback((kps) => {
     const prev = prevKpRef.current;
     const out = {};
     Object.entries(kps || {}).forEach(([name, pt]) => {
@@ -58,7 +68,31 @@ function App() {
     });
     prevKpRef.current = out;
     return out;
-  };
+  }, []);
+
+  // Hareket tahmini için önceki ham sonuç (stabil referans, effect içinde tazeliğini korur)
+  const velPrevRef = useRef(null);
+
+  // Ara kare tahmini: iki inference arası iskelet donmasın diye son hızla ilerletir.
+  // Sadece çizimde kullanılır, analiz verisini değiştirmez.
+  const predictKeypoints = useCallback((kps) => {
+    const prev = velPrevRef.current || {};
+    const out = {};
+    Object.entries(kps || {}).forEach(([name, pt]) => {
+      const p = prev[name];
+      let vx = 0, vy = 0;
+      if (p) {
+        vx = (pt.x - p.x) * 0.5;
+        vy = (pt.y - p.y) * 0.5;
+        // Aşırı sıçramayı engelle (tek karede en fazla 12px)
+        const m = Math.hypot(vx, vy);
+        if (m > 12) { vx = (vx / m) * 12; vy = (vy / m) * 12; }
+      }
+      out[name] = { ...pt, x: pt.x + vx, y: pt.y + vy };
+    });
+    velPrevRef.current = kps;
+    return out;
+  }, []);
 
   // Canvas üzerine iskelet ve noktaları çizen fonksiyon
   const drawSkeleton = useCallback((keypoints, spineOrder = []) => {
@@ -123,6 +157,14 @@ function App() {
 
     const resetAnalysis = () => {
       prevKpRef.current = {};
+      velPrevRef.current = null;
+      latestRef.current = { keypoints: {}, spine_order: [] };
+      uiRef.current = {
+        view: "BEKLENIYOR", keypoints: {}, spine_order: [],
+        metrics: {}, asymmetry_percentage: 0, risk_text: "BELIRSIZ",
+      };
+      inFlightRef.current = false;
+      frameIdRef.current = 0;
       setAnalysisData({
         view: "BEKLENIYOR",
         keypoints: {},
@@ -149,7 +191,15 @@ function App() {
       );
     };
 
+    // Inference yoklaması + render durumu (sendFrame'ten önce tanımlı olmalı)
+    let pollTimer = null;
+    let rafId = null;
+    let lastUiAt = 0;
+    let lastDrawAt = 0;
+
     const sendFrame = async () => {
+      // Tek-uçuş: önceki istek bitmeden yeni kare gönderme (kuyruk birikmez, lag birikmez).
+      if (inFlightRef.current) return;
       const video = videoRef.current;
       const pCanvas = processingCanvasRef.current;
       if (!video || !pCanvas) return;
@@ -169,14 +219,17 @@ function App() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3000);
 
+      inFlightRef.current = true;
       try {
         const response = await fetch("https://prevail-exponent-repair.ngrok-free.dev/process-frame", {
           method: "POST",
           body: formData,
           signal: controller.signal,
         });
+        // Backend meşgulse (429): bu kareyi atla, bir sonrakini dene. Çizim son sonuçla devam eder.
+        if (response.status === 429) { failCount = 0; return; }
         const result = await response.json();
-        if (result.error || stopped) return;
+        if (result.error || result.busy || stopped) return;
         failCount = 0;
 
         // Koordinatları orijinal video boyutuna geri ölçekle
@@ -186,33 +239,61 @@ function App() {
           scaled[name] = { ...pt, x: pt.x * inv, y: pt.y * inv };
         });
 
-        result.keypoints = smoothKeypoints(scaled);
-        result.spine_order = result.spine_order || [];
-        setAnalysisData(result);
-        setFrameCount(prev => prev + 1);
-        drawSkeleton(result.keypoints, result.spine_order);
+        const smoothed = smoothKeypoints(scaled);
+        const spineOrder = result.spine_order || [];
+        latestRef.current = { keypoints: smoothed, spine_order: spineOrder };
+        // React paneli her inference'ta değil, seyreltilmiş aralıkla güncellenir (re-render maliyeti düşer).
+        const now = performance.now();
+        if (now - lastUiAt >= UI_UPDATE_MS) {
+          lastUiAt = now;
+          uiRef.current = {
+            view: result.view,
+            keypoints: smoothed,
+            spine_order: spineOrder,
+            metrics: result.metrics || {},
+            asymmetry_percentage: result.asymmetry_percentage || 0,
+            risk_text: result.risk_text || "BELIRSIZ",
+          };
+          setAnalysisData(uiRef.current);
+          setFrameCount(prev => prev + 1);
+        }
       } catch (e) {
         failCount++;
         if (e.name !== 'AbortError') console.error("API Bağlantı Hatası:", e);
       } finally {
         clearTimeout(timeout);
+        inFlightRef.current = false;
       }
     };
 
-    // Önceki istek bitmeden yenisi gönderilmez; kamera yoksa / sekme gizliyse hiç istek atılmaz
-    const loop = async () => {
-      while (!stopped) {
-        if (!cameraIsLive() || document.hidden) {
-          await new Promise(r => setTimeout(r, 300));
-          continue;
+    // Inference yoklaması: sabit aralık, üst üste binmez. Render bundan bağımsız akar.
+    const startPolling = () => {
+      if (pollTimer) return;
+      pollTimer = setInterval(() => {
+        if (stopped || document.hidden || !cameraIsLive()) return;
+        // Backend'e ulaşılamıyorsa yoklamayı kademeli seyrelt (en fazla 3 sn)
+        if (failCount > 0 && (frameIdRef.current % Math.min(2 ** failCount, 24)) !== 0) {
+          frameIdRef.current++;
+          return;
         }
-        const t0 = performance.now();
-        await sendFrame();
-        // Backend'e ulaşılamıyorsa bekleme süresini kademeli artır (en fazla 3 sn)
-        const gap = failCount > 0 ? Math.min(MIN_FRAME_GAP * 2 ** failCount, 3000) : MIN_FRAME_GAP;
-        const wait = gap - (performance.now() - t0);
-        await new Promise(r => setTimeout(r, Math.max(wait, 10)));
+        frameIdRef.current++;
+        sendFrame();
+      }, POLL_MS);
+    };
+
+    // Render döngüsü: son bilinen iskeleti her ekranda yeniden çizer.
+    // Inference 7-8 FPS gelse bile iskelet canlı kalır, hareket tahmini (ekstrapolasyon) ile ara kareler doldurulur.
+    const renderLoop = (t) => {
+      if (stopped) return;
+      // ~30 FPS çizim yeterli, CPU'yu yormaz
+      if (t - lastDrawAt >= 33 && cameraIsLive()) {
+        lastDrawAt = t;
+        const { keypoints, spine_order } = latestRef.current;
+        if (keypoints && Object.keys(keypoints).length > 0) {
+          drawSkeleton(predictKeypoints(keypoints), spine_order);
+        }
       }
+      rafId = requestAnimationFrame(renderLoop);
     };
 
     const onVisibility = () => { if (document.hidden) prevKpRef.current = {}; };
@@ -244,7 +325,8 @@ function App() {
           resetAnalysis();
         });
 
-        loop();
+        startPolling();
+        rafId = requestAnimationFrame(renderLoop);
       })
       .catch((err) => {
         console.error("Kamera hatası:", err);
@@ -256,9 +338,11 @@ function App() {
     return () => {
       stopped = true;
       document.removeEventListener('visibilitychange', onVisibility);
+      if (pollTimer) clearInterval(pollTimer);
+      if (rafId) cancelAnimationFrame(rafId);
       if (stream) stream.getTracks().forEach(t => t.stop());
     };
-  }, [drawSkeleton, retryKey]);
+  }, [drawSkeleton, smoothKeypoints, predictKeypoints, retryKey]);
 
   const getViewColor = (view) => {
     if (view === "FRONT") return "#00ff00";
